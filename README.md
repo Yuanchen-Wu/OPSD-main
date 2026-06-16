@@ -304,6 +304,63 @@ published results. See the [paper](https://arxiv.org/pdf/2601.18734v3) and
 
 ---
 
+## 10. Data provenance & batch sampling (and research directions)
+
+### 10a. Where the teacher's reference solutions come from
+
+The teacher context is built from the `solution` field of
+[`siyanzhao/Openthoughts_math_30k_opsd`](https://huggingface.co/datasets/siyanzhao/Openthoughts_math_30k_opsd)
+(~29,434 rows), a curated **OpenThoughts**-derived math dataset. These reference solutions are a
+**mix of ground-truth and teacher-model-generated reasoning traces** — largely synthetic (e.g. traces
+from strong models in the OpenThoughts pipeline), **not guaranteed human-written**. They are *intended*
+to be correct/verifiable, but **this repo does not prove or re-verify their correctness at training
+time** — `data_collator.py` simply trusts each row and injects `solution` into the teacher prompt. So a
+wrong reference solution would condition the teacher on wrong hindsight. (The student never copies the
+solution; it only imitates the teacher's per-token distribution along its own rollout.)
+
+> **Research directions — solution quality & verification**
+> - **Verify-then-distill:** run `math_verify` (or an LLM judge) on each `solution` before training and
+>   drop/flag unverifiable ones; measure how solution noise affects student accuracy.
+> - **Provenance-aware weighting:** tag rows as human-GT vs model-generated and weight the JSD loss (or
+>   teacher trust) accordingly; test whether ground-truth-anchored solutions help most.
+> - **Multi-solution teachers:** condition the teacher on several diverse reference solutions and study
+>   robustness to any single bad trace.
+> - **Self-consistency filtering:** keep only solutions whose final answer matches a majority vote of
+>   independently sampled teacher solutions.
+
+### 10b. How training examples are selected per batch
+
+There is **no custom sampling logic** in `opsd_train.py`: it passes the full `train` split to
+`OPSDTrainer` (a TRL/Hugging Face `Trainer` subclass), which builds the dataloader internally and uses
+a **shuffled sampler by default**. The per-step flow is:
+
+1. Load all ~29,434 rows.
+2. Trainer creates a **shuffled** training dataloader.
+3. Each batch = randomly ordered rows from that shuffle.
+4. `data_collator.py` builds the **student prompt** (`problem`) and **teacher prompt**
+   (`problem + solution`) for each row.
+5. The student generates **on-policy** completions for the batch.
+6. The teacher scores those same completions with reference-solution context.
+7. The JSD loss updates the **student LoRA**.
+
+Randomness therefore enters in two places: **example order** (shuffled dataloader) and **rollout
+sampling** (`temperature`/`top_p`/`top_k`). So even when the same problem reappears in a later epoch,
+the student may follow a different trajectory because the rollout is freshly sampled.
+
+> **Research directions — active / curriculum sampling**
+> - **Difficulty curriculum:** order problems easy→hard (e.g. by base-model pass-rate) instead of pure
+>   shuffle, and measure convergence speed / peak accuracy.
+> - **Learnability-based active sampling:** prioritize problems where student↔teacher divergence (JSD)
+>   or reward is highest/most-informative — skip examples the student already matches the teacher on.
+> - **Online filtering:** within a step, generate, score, and **keep only high-signal rollouts** (e.g.
+>   medium-difficulty, non-degenerate length) for the backward pass.
+> - **Replay / dynamic re-weighting:** revisit problems the student keeps getting wrong, or downweight
+>   trivial ones, to spend compute where distillation signal is largest.
+> - **Seeded reproducibility:** fix `--seed`/`--data_seed` and log the sampler order to make ablations
+>   on the above strictly comparable.
+
+---
+
 ## Acknowledgements
 
 This is an adaptation of the original OPSD repository. The method and original implementation build on
