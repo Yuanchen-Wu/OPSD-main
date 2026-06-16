@@ -1,0 +1,36 @@
+## Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+## Environments / secrets
+.env
+.venv/
+venv/
+ENV/
+
+## OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+## Data / outputs (Colab + training artifacts)
+opsd_outputs/
+**/opsd_outputs/
+outputs/
+checkpoints/
+**/checkpoint-*/
+wandb/
+logs/
+
+## Large model caches (local)
+.cache/
+**/.cache/
+
