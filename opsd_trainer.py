@@ -1284,26 +1284,31 @@ class OPSDTrainer(SFTTrainer):
         # Clear buffer after saving
         self._generation_outputs_buffer.clear()
 
-    @profiling_decorator
-    def training_step(
-        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
-    ) -> torch.Tensor:
+    def prepare_on_policy_distillation_batch(self, model, inputs):
         """
-        Perform a training step with self-distillation.
+        Generate student on-policy completions and assemble the full input dictionary
+        expected by ``compute_loss``.
 
-        If reason_first=True:
-        1. Generate teacher's reasoning about the solution
-        2. Append reasoning to teacher prompt
-        3. Generate completions from student prompts
-        4. Compute JSD loss
+        This contains the exact reasoning/generation/assembly logic that ``training_step``
+        used to run inline, factored out so it can be reused by:
+        1. normal OPSD ``training_step`` (below), and
+        2. LESS-OPSD gradient extraction (``less_opsd_selector``).
 
-        Otherwise:
-        1. Generate completions from student prompts
-        2. Construct full sequences for both student and teacher with the generation
-        3. Compute JSD loss on the generation tokens
+        It preserves the original training behavior exactly: the OPSD loss is unchanged,
+        generation behavior is unchanged, and ``fixed_teacher`` / EMA teacher /
+        ``reason_first`` / vLLM vs non-vLLM / thinking-machines loss / ``top_k_loss`` /
+        ``jsd_token_clip`` / ``student_thinking`` / ``teacher_thinking`` are all honored
+        downstream by ``compute_loss`` exactly as before.
+
+        Args:
+            model: the (possibly wrapped) model used for generation.
+            inputs: collator outputs (and, for ``reason_first``, reasoning prompts).
+
+        Returns:
+            tuple ``(inputs, prompt_texts, completion_texts)`` where ``inputs`` has been
+            updated in place with ``student_input_ids``, ``student_attention_mask``,
+            ``teacher_input_ids``, ``teacher_attention_mask`` and ``labels``.
         """
-        on_policy = True
-
         # === REASONING PHASE (if enabled) ===
         if self.reason_first:
             print(f"\n{'='*80}")
@@ -1417,6 +1422,32 @@ class OPSDTrainer(SFTTrainer):
             labels[labels == self.processing_class.pad_token_id] = -100
 
         inputs["labels"] = labels
+
+        return inputs, prompt_texts, completion_texts
+
+    @profiling_decorator
+    def training_step(
+        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
+    ) -> torch.Tensor:
+        """
+        Perform a training step with self-distillation.
+
+        If reason_first=True:
+        1. Generate teacher's reasoning about the solution
+        2. Append reasoning to teacher prompt
+        3. Generate completions from student prompts
+        4. Compute JSD loss
+
+        Otherwise:
+        1. Generate completions from student prompts
+        2. Construct full sequences for both student and teacher with the generation
+        3. Compute JSD loss on the generation tokens
+        """
+        on_policy = True
+
+        # Build the on-policy distillation batch (generation + assembly). Shared with
+        # LESS-OPSD gradient extraction so selection gradients match training gradients.
+        inputs, prompt_texts, completion_texts = self.prepare_on_policy_distillation_batch(model, inputs)
 
         # Log prompt and completion texts
         self._textual_logs["prompt"].extend(gather_object(prompt_texts))

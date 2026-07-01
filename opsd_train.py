@@ -106,6 +106,21 @@ class CustomScriptArguments(ScriptArguments):
             "Default True. Set to False for the matched non-thinking ablation (both nonthink)."
         },
     )
+    selected_indices_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional path to a LESS-OPSD selection file (selected_indices.json). When set, "
+            "training runs only on the selected subset of the train split. When None (default), "
+            "training behavior is unchanged."
+        },
+    )
+    selection_method: str = field(
+        default="none",
+        metadata={
+            "help": "Label describing how selected_indices_path was produced (e.g. 'less_opsd', "
+            "'random', 'none'). Informational only; does not change training behavior."
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -265,6 +280,18 @@ if __name__ == "__main__":
 
     dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
     train_dataset = dataset["train"]
+
+    # Optional LESS-OPSD data selection: restrict training to a precomputed subset.
+    # When selected_indices_path is None, training behavior is completely unchanged.
+    if script_args.selected_indices_path is not None:
+        from less_opsd_selector import load_selected_indices
+
+        indices = load_selected_indices(script_args.selected_indices_path)
+        train_dataset = train_dataset.select(indices)
+        print(
+            f"[LESS-OPSD] Using selected subset with {len(indices)} examples "
+            f"(method={script_args.selection_method}, path={script_args.selected_indices_path})"
+        )
 
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,
