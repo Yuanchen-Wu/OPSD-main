@@ -1,196 +1,288 @@
-# LESS-OPSD: Gradient-Based Data Selection for On-Policy Self-Distillation
+# LESS-OPSD: gradient-based data selection for on-policy self-distillation
 
-This document describes a **LESS-inspired**, gradient-based data selection method
-adapted to this repository's **OPSD (On-Policy Self-Distillation)** training. It
-explains what the original LESS method does, which ideas we reuse, why LESS is not
-directly applicable to OPSD, and the precise gradient definitions and approximations
-used by our implementation.
+This document describes the methodology of the LESS-inspired data selector implemented
+in `less_opsd_selector.py` (generic machinery) and `less_opsd_backend.py` (OPSD
+self-distillation backend). Method version: **2.0**.
 
-Reference (methodology only, **not vendored**):
-- Repo: https://github.com/princeton-nlp/LESS
-- Paper: *LESS: Selecting Influential Data for Targeted Instruction Tuning*, ICML 2024.
+Reference for the original method (methodology only, not vendored):
+[princeton-nlp/LESS](https://github.com/princeton-nlp/LESS).
 
----
+## 1. Setting
 
-## 1. What the original LESS does
+The repository trains a student (a LoRA adapter over a frozen base model) with an
+on-policy self-distillation (OPSD) loss: the student generates a completion for a
+problem, and a teacher — the same underlying model given privileged reference-solution
+context — scores that completion. Training uses the Hugging Face/TRL trainer with AdamW.
 
-LESS selects a small, influential subset of an instruction-tuning corpus that is most
-useful for a given *target* task. The pipeline is roughly:
+LESS-OPSD asks: *which training problems, if trained on next, would most improve the
+model on a small target set?* It answers by comparing (projected) candidate update
+directions against (projected) target loss gradients.
 
-1. **Warmup LoRA training** on a small random fraction of the data so the model has a
-   meaningful gradient geometry.
-2. **Gradient feature extraction** for every candidate training example:
-   - Run a forward/backward pass of the supervised instruction-tuning loss
-     `CE(answer_i | instruction_i)`.
-   - Collect the gradient **only over trainable (LoRA) parameters**.
-   - Optionally combine with Adam optimizer moments to form an "Adam-preconditioned"
-     gradient (`obtain_gradients_with_adam`).
-   - **Project** the (very high-dimensional) gradient down to a few thousand dimensions
-     using a random projection (TRAK `CudaProjector`/`BasicProjector`), and store the
-     low-dimensional features in a gradient datastore on disk.
-3. **Target/validation gradient features** are computed the same way on a few labeled
-   examples of the target task.
-4. **Influence scoring**: the influence of a training example on the target is the inner
-   product (cosine, after normalization) between the projected training gradient and the
-   projected target gradient (`matching.py: calculate_influence_score = train @ valid.T`),
-   summed over checkpoints with learning-rate weights.
-5. **Selection**: rank candidates by score and keep the top fraction / top-k
-   (`write_selected_data.py`), then train on the selected subset.
+## 2. Roles of the different components (do not conflate these)
 
-### Parts of the LESS repo reused *conceptually*
+It is easy to mix up several distinct things; the implementation keeps them separate:
 
-| LESS file | Idea we reuse |
-|---|---|
-| `less/data_selection/collect_grad_reps.py` | Backprop a per-example loss, concatenate **only trainable** `p.grad`, then **project** to a low dimension. We keep the "trainable-params-only + projection" idea; we replace TRAK projection with CountSketch and replace the CE loss with the OPSD loss. |
-| `less/data_selection/get_info.py` | Driver that loads a model, asserts only LoRA params require grad, and collects grads for a dataset. Mirrored by our `LESSOPSDGradientExtractor` + CLI. |
-| `less/data_selection/matching.py` | `influence = train_features @ target_features.T`. We use the same normalized inner product (cosine) scoring. |
-| `less/data_selection/write_selected_data.py` | Sort by score, take top fraction / top-k, persist selection. Mirrored by our artifact writer. |
+* **OPSD/JSD/KL loss** — the *training objective* \(L_{\mathrm{OPSD}}\). It defines what
+  gradient a training example produces. It is not an optimizer.
+* **AdamW** — the *parameter optimizer*. It transforms raw gradients into parameter
+  updates using running moments \(m, v\). Selection can either ignore this (raw
+  features) or model it (optimizer-aware features).
+* **On-policy rollout sampling** — the stochastic generation of student completions.
+  Each candidate's gradient depends on which rollout was sampled; this is estimation
+  noise, addressed with multiple rollouts, not with the optimizer.
+* **Policy-gradient estimators** — not used here. The OPSD loss backpropagates through
+  the token-level distillation loss with the discrete rollout *detached*, exactly as in
+  `OPSDTrainer.training_step`. Selection reuses that same backward path.
+* **Static preselection vs online reselection** — this implementation scores and selects
+  *once*, before final training (optionally at several warmup checkpoints). It does not
+  reselect during training.
 
-### Parts we deliberately **do not** reuse
+## 3. Formulation
 
-- TRAK / `fast_jl` CUDA projectors and the `trak` dependency (heavy, CUDA-specific).
-  We use a dependency-free CountSketch projection instead.
-- Adam-preconditioned gradients and multi-checkpoint LR-weighted aggregation (these are
-  natural future extensions; the MVP uses a single model and raw SGD-style gradients).
-- The supervised cross-entropy loss `CE(answer | instruction)`. **This is the key
-  conceptual change** — see below.
+At checkpoint \(k\) with student parameters \(\theta_k\) and teacher state \(\phi_k\),
+for candidate problem \(x_i\) with reference solution \(r_i\), sample rollout \(m\) from
+the current student policy:
 
----
+\[
+y_{i,m}^{(k)} \sim \pi_{\theta_k}(\cdot \mid x_i),
+\qquad
+g_{i,k,m} = \nabla_\theta L_{\mathrm{OPSD}}\big(x_i, r_i, y_{i,m}^{(k)}; \theta_k, \phi_k\big).
+\]
 
-## 2. Why original LESS is not directly applicable to OPSD
+Only trainable (LoRA) parameters contribute. Rollouts are generated by the checkpoint's
+current student policy and remain detached during backward.
 
-LESS assumes **supervised instruction tuning**: each example is a fixed
-`(instruction, answer)` pair and the gradient is taken of a static cross-entropy loss on
-the gold answer. The "influence" of an example is defined entirely by that fixed
-supervised gradient.
+### 3.1 Candidate feature types
 
-OPSD is **not** supervised fine-tuning on a fixed answer. In OPSD:
+**`raw_gradient`** (baseline; identical to the v1 selector):
 
-- The student only sees the **problem** and **generates its own on-policy rollout**.
-- The teacher sees the **problem + a privileged reference solution** and scores the
-  student's *own* rollout.
-- The training signal is a **distillation divergence** (generalized JSD, or a
-  reverse-KL / "thinking-machines" policy-gradient variant) between teacher and student
-  token distributions over the **student-generated** tokens — not cross-entropy against a
-  fixed gold answer.
+\[
+\Gamma^{\mathrm{raw}}_{i,k,m} = g_{i,k,m}.
+\]
 
-Consequences:
+**`adamw_candidate_update`** — approximate the update AdamW *would* make if this
+candidate's gradient were processed next. With the checkpoint's saved first/second
+moments \(m_k, v_k\) and optimizer step \(t_k\):
 
-1. The "example gradient" must be taken of the **OPSD distillation loss**, evaluated on a
-   **freshly generated student rollout**, not of a supervised CE loss on a gold answer.
-2. The gradient depends on a **stochastic rollout**, so it is a sample of a distribution,
-   not a deterministic quantity (this is the main approximation; see §5).
-3. The privileged reference solution enters only through the **teacher context**, exactly
-   as in normal OPSD training — it is never a direct label for CE.
+\[
+m' = \beta_1 m_k + (1-\beta_1) g_{i,k,m}, \qquad
+v' = \beta_2 v_k + (1-\beta_2) g_{i,k,m}^2,
+\]
+\[
+\hat m' = \frac{m'}{1-\beta_1^{t_k+1}}, \qquad
+\hat v' = \frac{v'}{1-\beta_2^{t_k+1}}, \qquad
+\Gamma^{\mathrm{AdamW}}_{i,k,m} = \frac{\hat m'}{\sqrt{\hat v'} + \epsilon}.
+\]
 
-Therefore we keep LESS's *machinery* (trainable-grad extraction → projection → cosine
-matching → top-k) but replace the *gradient feature* with the OPSD gradient produced by
-the existing `OPSDTrainer.compute_loss`.
+For weight decay 0, the actual AdamW displacement is exactly \(-\eta\,\Gamma^{\mathrm{AdamW}}\)
+(verified against a real `torch.optim.AdamW` step in `tests/test_less_opsd_adamw.py`).
+The **decoupled weight-decay term is deliberately excluded**: at a fixed checkpoint it is
+identical for every candidate and therefore carries no ranking information. Neither the
+model nor the saved optimizer state is mutated; the hypothetical moments are computed on
+CPU copies, per parameter, and streamed directly into CountSketch.
 
----
+**`adamw_fixed_preconditioner`** — a simpler, linear-in-the-gradient ablation:
 
-## 3. The OPSD candidate gradient
+\[
+\Gamma^{\mathrm{fixed}}_{i,k,m} = \frac{g_{i,k,m}}{\sqrt{\hat v_k} + \epsilon},
+\qquad
+\hat v_k = \frac{v_k}{1-\beta_2^{t_k}}.
+\]
 
-For a candidate problem `i`, the gradient feature is
+Only the checkpoint's second moment is used; \(m_k, v_k\) are *not* hypothetically
+updated with the candidate gradient. Being linear, its behavior under minibatch
+averaging is easier to interpret.
 
-```
-g_i = grad_theta  L_OPSD(problem_i, reference_solution_i, student_rollout_i)
-```
+Both AdamW modes **require** a checkpoint with saved optimizer state (`optimizer.pt`)
+and fail with a clear error otherwise — there is no silent fallback to raw gradients.
 
-where
+### 3.2 Candidate/target asymmetry
 
-- `problem_i` is the problem text from the OPSD dataset row,
-- `reference_solution_i` is the privileged reference solution from the same row (used to
-  build the **teacher** context),
-- `student_rollout_i` is generated **on-policy** by the current/base student model from
-  the student prompt,
-- `L_OPSD` is the **existing** distillation loss implemented by
-  `OPSDTrainer.compute_loss` (generalized JSD by default, or the reverse-KL
-  "thinking-machines" variant, honoring `beta`, `temperature`, `top_k_loss`,
-  `jsd_token_clip`, `fixed_teacher`, EMA teacher, `student_thinking`/`teacher_thinking`,
-  and `reason_first`),
-- `theta` are the **trainable parameters only** (LoRA adapter weights for a PEFT model).
+The candidate side uses the optimizer-aware direction \(\Gamma_{i,k,m}\) — it
+approximates the *displacement training on the candidate would produce*. The target side
+always uses a **raw** target-loss gradient
 
-Crucially, the rollout and the loss are produced by the **same code path used during
-training** (`prepare_on_policy_distillation_batch` → `compute_loss`), so the selection
-gradient matches the training gradient by construction.
+\[
+h_{j,k} = \nabla_\theta L_{\mathrm{target},j}(\theta_k),
+\]
 
-## 4. The OPSD target gradient
+which measures how the target loss responds to an arbitrary parameter displacement. No
+AdamW preconditioning is applied to targets. Two target objectives are implemented:
 
-Given a small set of target/validation problems `j ∈ T`, the target feature is the mean
-of their (projected, per-example-normalized) OPSD gradients:
+* `target_objective=opsd` (default): the existing OPSD loss on target examples, with
+  target rollouts sampled from the current student checkpoint.
+* `target_objective=reference_ce`: supervised cross-entropy on the target example's
+  reference solution (a capability proxy that needs no rollout). This changes **only**
+  the target gradient; candidate features are still based on the actual OPSD loss.
 
-```
-g_target = mean_{j ∈ T}  project( grad_theta L_OPSD(problem_j, reference_solution_j, student_rollout_j) )
-```
+The target objective is a backend method (`compute_target_loss(prepared, objective)`),
+so new objectives can be added without touching candidate feature extraction.
 
-which is then normalized:
+### 3.3 Single rollout vs expected update
 
-```
-g_target_hat = normalize(g_target)
-```
+One rollout gives a noisy single-sample estimate of the expected candidate gradient.
+With \(M\) rollouts, each raw gradient is transformed (AdamW is nonlinear, so the
+transform is applied per rollout, *not* to the averaged gradient), projected with the
+same CountSketch mapping \(R\), then the **unnormalized** projections are averaged and
+normalized **once**:
 
-The candidate score is the cosine similarity between projected, normalized gradients:
+\[
+z_{i,k,m} = R\,\Gamma_{i,k,m}, \qquad
+\bar z_{i,k} = \frac{1}{M}\sum_{m=1}^{M} z_{i,k,m}, \qquad
+u_{i,k} = \frac{\bar z_{i,k}}{\lVert \bar z_{i,k} \rVert + \epsilon}.
+\]
 
-```
-score_i = < normalize(project(g_i)), g_target_hat >
-```
+This estimates the *direction of the expected update*, not the average of unit
+directions (normalizing each rollout first and then averaging is a different, rejected
+estimator; a unit test asserts the two differ when magnitudes differ).
 
-and we select the top fraction / top-k candidates by `score_i`.
+A **rollout consistency diagnostic** is saved per candidate and checkpoint:
 
----
+\[
+\rho_{i,k} = \Big\lVert \frac{1}{M}\sum_m \frac{z_{i,k,m}}{\lVert z_{i,k,m}\rVert + \epsilon} \Big\rVert
+\in [0, 1],
+\]
 
-## 5. Static cached-rollout approximation (the MVP)
+\(\rho \approx 1\) means rollout update directions agree; \(\rho \approx 0\) means they
+largely cancel. It is an analysis statistic only and does **not** modify the selection
+score.
 
-The MVP implements the **static, single-rollout, single-model** version:
+### 3.4 Target feature and per-checkpoint score
 
-1. Load the initial model (optionally with a LoRA adapter so the gradient lives in the
-   LoRA subspace, matching training).
-2. For each candidate problem: generate **one** student rollout, build the OPSD
-   distillation batch, run `compute_loss`, backprop **once**, project the trainable-param
-   gradient with CountSketch, normalize, store on CPU.
-3. Do the same for each target problem; average + normalize the target features.
-4. Score candidates by cosine alignment; select top-k / top-p.
-5. Save selected indices (consumable by `opsd_train.py --selected_indices_path`).
+Per target example, rollout projections are averaged before normalizing; the (single)
+target group feature is the normalized mean of per-example target features:
 
-This is intentionally a clean experimental MVP, not a framework. The model is **not**
-updated during selection (no `trainer.train()`), so the gradient geometry is that of the
-initial/base model — analogous to LESS *before* its multi-checkpoint aggregation.
+\[
+u^T_{j,k} = \operatorname{normalize}\Big(\tfrac{1}{M_T}\textstyle\sum_m R\,h_{j,k,m}\Big),
+\qquad
+u^T_k = \operatorname{normalize}\Big(\tfrac{1}{|T|}\textstyle\sum_{j \in T} u^T_{j,k}\Big).
+\]
 
-### Limitations
+Per-example target features are retained in the resumable feature store, so target
+groups / pairwise aggregation can be added later. The per-checkpoint score is the cosine
 
-- **Rollout stochasticity.** Each candidate gradient is computed from a *single* sampled
-  rollout. Temperature/top-p/top-k sampling means a different run can yield a different
-  gradient and therefore a different score. The MVP fixes seeds for the projection but the
-  generation itself is sampled; scores are noisy estimates of an expectation over rollouts.
-  *Future:* average gradients over multiple rollouts per candidate.
-- **Target-set sensitivity.** The selection is only as good as the target set. A small or
-  unrepresentative target subset biases selection toward a narrow slice of the problem
-  distribution. *Future:* larger / stratified target sets, or per-cluster targets.
-- **High compute cost.** Every candidate requires a full generation + forward + backward.
-  This is O(N) generations, which dominates cost. *Future:* cache rollouts, batch
-  gradient extraction, or restrict the candidate pool.
-- **Single model / single checkpoint.** No Adam preconditioning and no multi-checkpoint
-  LR-weighted aggregation (both used by full LESS). *Future:* add optimizer-state
-  preconditioning and checkpoint ensembling.
-- **Not online / adaptive yet.** Selection is computed once, up front, against a fixed
-  model. It does not refresh as the student improves during training. *Future:* periodic
-  online gradient refresh during OPSD training.
-- **Projection collisions.** CountSketch is a hashing projection; distinct gradient
-  coordinates can collide into the same bucket. Larger `projection_dim` reduces collision
-  noise at the cost of memory/compute.
+\[
+s_{i,k} = u_{i,k}^{\top} u^T_k.
+\]
 
----
+### 3.5 Multi-checkpoint aggregation
 
-## 6. Extensibility
+With warmup checkpoints \(k = 1..K\) and weights \(w_k\) (normalized to sum to one):
 
-The implementation is modular so the following can be added later without disrupting the
-MVP:
+\[
+s_i = \sum_{k=1}^{K} w_k\, s_{i,k}.
+\]
 
-- **Online gradient refresh** during OPSD training (recompute features every K steps).
-- **Multiple rollouts per candidate** (average `g_i` over rollouts to reduce variance).
-- **Diversity-aware selection** (e.g. facility-location / submodular selection on top of
-  the gradient features instead of pure top-k).
-- **CE-proxy baseline (`less_ce_proxy`)** that replaces `L_OPSD` with a plain
-  cross-entropy on the reference solution — a closer analogue of original LESS, useful as
-  an ablation. This is explicitly a *separate* method, never the default.
+Cosines are computed **independently at each checkpoint** and then aggregated —
+gradient features from different checkpoints are never averaged into one cosine.
+Weightings: `uniform`, `explicit` (user-supplied, normalized), and `learning_rate`
+(proportional to the last `learning_rate` entry logged in the checkpoint's
+`trainer_state.json` `log_history`; if that cannot be recovered the run fails — uniform
+weights are never silently substituted). The default remains a single checkpoint with
+weight one.
+
+### 3.6 Central score (full form)
+
+\[
+s_i = \sum_k w_k \cos\!\Big(
+R\,\tfrac{1}{M}\sum_m \Gamma_{\mathrm{AdamW}}\big(\nabla_\theta L_{\mathrm{OPSD},i}(y_{i,k,m})\big),\;
+R\,\nabla_\theta L_{\mathrm{target},k}
+\Big).
+\]
+
+## 4. Projection
+
+CountSketch / feature hashing is preserved: each coordinate of each (transformed)
+parameter tensor is hashed into one of `projection_dim` buckets with a random sign,
+deterministically from the *parameter name* and `projection_seed`. No dense projection
+matrix is materialized; accumulation is float32 on CPU. The low-level entry point
+`count_sketch_project_named_tensors(named_tensors, projection_dim, seed)` accepts any
+iterable of named tensors (this is what allows projecting AdamW-transformed vectors
+without overwriting `param.grad`); `count_sketch_project_trainable_grads(model, ...)`
+remains as the raw-gradient convenience wrapper with identical hashing.
+
+## 5. Static selection, fresh rollouts in final training
+
+The current implementation performs **static preselection**: warmup train → extract
+features at one or more warmup checkpoints → score → select → **restart final training
+from the original base initialization** on the selected subset. Final OPSD training
+generates fresh on-policy rollouts as usual; selection rollouts, candidate/target
+features, and cached logits are **never** reused during final training. Online
+reselection during training is a possible future extension, not implemented.
+
+## 6. Invalid features and error handling
+
+Non-finite rollout projections are dropped; if no finite rollout remains, or the
+averaged vector has (near-)zero norm, the example is marked **invalid**. Invalid
+candidates receive a final score of \(-\infty\), are reported in `scores.jsonl` with
+`"invalid": true` and `"final_score": null`, and are **never selected**. A candidate must
+be valid at *every* checkpoint to be selectable. Zero vectors are never silently
+normalized into ordinary candidates.
+
+Clear errors are raised for: missing `optimizer.pt`, non-AdamW optimizers (paged, fused,
+and 8-bit formats are not supported or tested), optimizer state that does not cover the
+trainable parameters or has mismatched shapes/betas/eps, checkpoints that do not match
+the current LoRA configuration, empty candidate/target sets, invalid rollout counts or
+checkpoint weights, and resume attempts with a mismatched configuration fingerprint.
+
+## 7. Reproducibility
+
+Seeds are separated: `projection_seed`, `rollout_seed`, `candidate_subset_seed`,
+`target_subset_seed`, `warmup_subset_seed` (all defaulting from the legacy `seed` for
+backward compatibility). Every rollout's generation seed is derived via a stable SHA-256
+hash of (base rollout seed, checkpoint id, example index, rollout number,
+candidate/target split) — never Python's process-dependent `hash()`. All seeds and the
+configuration fingerprint are saved in the artifacts. Exact generation reproducibility
+may still depend on hardware and the generation backend (e.g. CUDA nondeterminism);
+sampling is seeded as strongly as `torch.manual_seed` allows.
+
+## 8. Method names and artifact versioning
+
+Artifacts carry `method_version: "2.0"` plus a precise method name:
+
+* `less_opsd_raw_static` — raw gradient, single checkpoint (the v1-equivalent baseline);
+* `less_opsd_adamw_static` — AdamW candidate update, single checkpoint;
+* `less_opsd_adamw_multicheckpoint` — AdamW candidate update, several checkpoints
+  (`raw`/`adamw_fixed` variants are named analogously).
+
+Artifacts written by the v1 implementation carry `method_version: "1.0"` (or none) and
+method name `less_opsd_static_cached_rollout`, so old and new outputs are
+distinguishable.
+
+## 9. Architecture
+
+* `less_opsd_selector.py` — generic: gradient transforms, CountSketch, rollout
+  aggregation, checkpoint aggregation, top-k selection, resumable feature store,
+  artifact I/O. Depends only on `torch` + stdlib; never reads dataset fields.
+* `less_opsd_backend.py` — the `DistillationGradientBackend` implementation wrapping
+  `OPSDTrainer`: prompt construction (via the existing collator), on-policy rollout
+  generation, teacher scoring, OPSD loss, `reference_ce` target loss, checkpoint/LoRA/
+  optimizer-state loading, learning-rate recovery.
+* `less_opsd_select.py` — CLI orchestration.
+
+## 10. Future extension to general on-policy distillation
+
+The selector interacts with the distillation setup only through the backend protocol
+(`student_model`, `prepare_candidate_example`, `compute_candidate_loss`,
+`prepare_target_example`, `compute_target_loss`, `metadata`). Supporting a *separate*
+teacher model (a larger frozen teacher, rather than the same model with privileged
+context) requires implementing another backend that builds teacher prompts, runs teacher
+scoring, and computes the student loss — the optimizer-aware selection machinery
+(transforms, projection, rollout/checkpoint aggregation, resume) is unchanged.
+
+**External-teacher distillation is not currently implemented.** Likewise out of scope in
+this iteration: online reselection during training, remote/API teachers, cross-tokenizer
+distillation, PPO/GRPO trainers, full-parameter gradient storage, TRAK/`fast_jl`, and
+dense random projections.
+
+## 11. Known limitations
+
+* Candidate features model a *single-example* AdamW step; real training averages
+  gradients over minibatches, and AdamW is nonlinear, so the modeled update is an
+  approximation of the candidate's marginal contribution.
+* Selection remains static: gradient geometry is measured at warmup checkpoints and
+  assumed to remain informative through final training.
+* Teacher state \(\phi_k\) at a warmup checkpoint reflects that checkpoint's adapter
+  (unless `fixed_teacher` is used), so scores are conditioned on the warmup trajectory.
+* CountSketch preserves inner products only in expectation; `projection_dim` controls
+  the variance of the cosine estimates.
