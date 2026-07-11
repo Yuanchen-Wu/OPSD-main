@@ -1,155 +1,159 @@
-# LESS-OPSD: Usage
+# LESS-OPSD usage (v2): warmup → selection → final training
 
-Gradient-based data selection for OPSD on-policy self-distillation. See
-[`less_opsd_methodology.md`](./less_opsd_methodology.md) for the conceptual background.
+This guide covers the three-stage, Colab-friendly workflow. See
+`docs/less_opsd_methodology.md` for the method itself.
 
-The selection gradient is the **OPSD distillation gradient** computed by
-`OPSDTrainer.compute_loss` over a fresh on-policy student rollout — not a supervised
-cross-entropy gradient.
+The pipeline is deliberately LESS-style:
 
----
+1. **Stage A (warmup)** — train briefly on a small *random* subset to obtain checkpoints
+   whose AdamW optimizer state encodes useful gradient geometry.
+2. **Stage B (selection)** — score the candidate pool against a target set using those
+   checkpoints, and save `selected_indices.json`.
+3. **Stage C (final training)** — **restart from the original base initialization** and
+   run standard OPSD training on the selected subset with fresh on-policy rollouts.
 
-## Pipeline overview
+Final training does **not** continue from the warmup model, and never reuses selection
+rollouts, features, or cached logits.
 
-1. **Select** influential training examples with `less_opsd_select.py` → writes
-   `selected_indices.json`.
-2. **Train** OPSD on just that subset by passing
-   `--selected_indices_path .../selected_indices.json` to `opsd_train.py`.
+## Stage A: warmup
 
----
-
-## 1. Tiny smoke LESS-OPSD selection
-
-Runs the whole pipeline on a tiny pool with a small projection so it finishes quickly:
+Create a reproducible random warmup subset (artifact format is compatible with
+`load_selected_indices` / `--selected_indices_path`):
 
 ```bash
 python less_opsd_select.py \
-  --model_name_or_path Qwen/Qwen3-0.6B \
-  --candidate_limit 32 \
-  --target_limit 8 \
-  --selection_fraction 0.25 \
-  --projection_dim 128 \
-  --output_dir outputs/less_opsd_selection/smoke \
-  --seed 42
+  --selection_method warmup_subset \
+  --selection_num_examples 500 \
+  --warmup_subset_seed 7 \
+  --output_dir outputs/warmup_subset
 ```
 
-This loads the model with a LoRA adapter, generates one on-policy rollout per candidate
-and per target example, computes the OPSD loss + gradient, projects it with CountSketch,
-scores candidates by cosine alignment with the averaged target gradient, and selects the
-top 25%.
+Then run a short OPSD warmup on that subset with the existing training script. Make sure
+checkpoints are saved (HF Trainer checkpoints include `optimizer.pt`,
+`trainer_state.json`, and the LoRA adapter by default):
 
-## 2. Larger LESS-OPSD selection
+```bash
+python opsd_train.py \
+  ... your usual lightweight arguments ... \
+  --selected_indices_path outputs/warmup_subset/selected_indices.json \
+  --selection_method warmup_random \
+  --output_dir outputs/warmup \
+  --save_steps 25 --save_total_limit 4 \
+  --logging_steps 5      # needed later for checkpoint_weighting=learning_rate
+```
+
+This produces e.g. `outputs/warmup/checkpoint-25`, `outputs/warmup/checkpoint-50`, each
+containing the LoRA adapter, `optimizer.pt` (AdamW moments), and `trainer_state.json`.
+
+## Stage B: selection
+
+### Colab example (AdamW-aware, 1–2 checkpoints, 2 rollouts)
 
 ```bash
 python less_opsd_select.py \
   --model_name_or_path Qwen/Qwen3-0.6B \
-  --dataset_name siyanzhao/Openthoughts_math_30k_opsd \
-  --dataset_split train \
+  --feature_type adamw_candidate_update \
+  --target_objective opsd \
+  --checkpoint_paths outputs/warmup/checkpoint-25 outputs/warmup/checkpoint-50 \
+  --checkpoint_weighting uniform \
+  --num_candidate_rollouts 2 \
+  --num_target_rollouts 2 \
+  --projection_dim 4096 \
   --candidate_limit 2000 \
   --target_limit 128 \
   --selection_fraction 0.05 \
-  --projection_dim 4096 \
-  --output_dir outputs/less_opsd_selection/test_run \
-  --seed 42
+  --save_every 25 \
+  --resume \
+  --output_dir outputs/less_opsd_selection/adamw_run
 ```
 
-Useful flags (defaults mirror `opsd_train.py` so selection gradients match training):
+Notes:
 
-- `--fixed_teacher`, `--use_ema_teacher`, `--ema_decay`
-- `--reason_first`
-- `--use_tinker_loss` (thinking-machines reverse-KL loss instead of JSD)
-- `--top_k_loss`, `--jsd_token_clip`, `--beta`, `--lmbda`
-- `--student_thinking`, `--teacher_thinking` / `--no_teacher_thinking`
-- `--temperature`, `--top_p`, `--top_k`, `--max_completion_length`, `--max_length`
-- `--lora_r`, `--lora_alpha`, `--lora_target_modules`, `--no_peft`
-- `--selection_num_examples N` (overrides `--selection_fraction`)
-- `--save_candidate_features` (also dumps `candidate_features.pt`, which can be large)
+* `--feature_type adamw_candidate_update` **requires** `--checkpoint_paths` pointing at
+  HF Trainer checkpoints that contain `optimizer.pt`. There is no silent fallback.
+* `--resume` makes extraction restartable after a Colab disconnect: partial features are
+  saved every `--save_every` examples under `<output_dir>/resume/`, guarded by a
+  configuration fingerprint. Re-running the same command skips completed examples;
+  changing the projection seed, checkpoints, feature type, rollout counts, or target
+  objective is rejected with a clear error (use a fresh `--output_dir`).
+* `--checkpoint_weighting learning_rate` weights each checkpoint by the last
+  `learning_rate` logged in its `trainer_state.json`; `explicit` takes
+  `--checkpoint_weights 0.3 0.7` (normalized to sum to one).
+* The LoRA flags (`--lora_r`, `--lora_alpha`, `--lora_target_modules`) and the OPSD loss
+  flags must match the warmup run, otherwise checkpoint loading fails.
+* Selection loads one checkpoint at a time (adapter weights are swapped in place;
+  optimizer moments stay on CPU), so memory stays at one-model level.
 
-### Target set behavior
+### Cheap smoke test (raw gradients, no warmup checkpoint needed)
 
-- If `--target_dataset_name` is **not** provided, a deterministic subset of the candidate
-  dataset is used as the target set, and it is **disjoint** from the candidate indices by
-  default.
-- Pass `--allow_candidate_target_overlap` to permit overlap.
-- Provide `--target_dataset_name`/`--target_dataset_split` to use a separate target set.
+```bash
+python less_opsd_select.py \
+  --model_name_or_path Qwen/Qwen3-0.6B \
+  --feature_type raw_gradient \
+  --num_candidate_rollouts 1 \
+  --candidate_limit 32 \
+  --target_limit 8 \
+  --selection_fraction 0.25 \
+  --max_completion_length 128 \
+  --projection_dim 4096 \
+  --output_dir outputs/less_opsd_selection/raw_smoke
+```
 
-## 3. Random baseline
+This is the v1-equivalent baseline (`less_opsd_raw_static`) run at the base
+initialization; useful to verify the environment before spending compute on the
+AdamW-aware run.
 
-Same output format as LESS-OPSD, but selection is random (no model required, so it is
-fast and cheap):
+### Random baseline
 
 ```bash
 python less_opsd_select.py \
   --selection_method random \
   --candidate_limit 2000 \
   --selection_fraction 0.05 \
-  --output_dir outputs/less_opsd_selection/random_smoke \
-  --seed 42
+  --output_dir outputs/less_opsd_selection/random_smoke
 ```
 
-## 4. Train OPSD on the selected subset
+## Stage C: final training
 
-Pass the produced file to `opsd_train.py`. When `--selected_indices_path` is omitted,
-training behavior is completely unchanged.
+Restart from the **original base model** (do not resume from the warmup checkpoint) and
+restrict the dataset to the selection:
 
 ```bash
 python opsd_train.py \
-  --selected_indices_path outputs/less_opsd_selection/smoke/selected_indices.json \
+  ... your usual arguments (same base model as the warmup) ... \
+  --selected_indices_path outputs/less_opsd_selection/adamw_run/selected_indices.json \
   --selection_method less_opsd \
-  --model_name_or_path Qwen/Qwen3-0.6B \
-  --attn_implementation sdpa \
-  --torch_dtype bfloat16 --bf16 True \
-  --learning_rate 1e-5 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 1 \
-  --output_dir outputs/opsd_less_run \
-  --run_config less_opsd_smoke \
-  --max_steps 10 \
-  --max_completion_length 256 \
-  --max_length 2048 \
-  --beta 0 --lmbda 1 \
-  --use_peft --lora_r 16 --lora_alpha 32 \
-  --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
-  --fixed_teacher \
-  --report_to none
+  --output_dir outputs/final_selected
 ```
 
-`opsd_train.py` will print how many examples remain after selection, e.g.
-`[LESS-OPSD] Using selected subset with 8 examples (...)`.
+Training behavior is otherwise unchanged: the student generates fresh on-policy rollouts
+every step, exactly as without selection. With `--selected_indices_path` unset, training
+is completely unaffected by any of the selection code.
 
----
+## Artifacts
 
-## Files saved by the selector
+Written to `--output_dir`:
 
-All under `--output_dir`:
+* `selected_indices.json` — selected original dataset indices + full metadata (method
+  name/version, feature type, target objective, checkpoint ids/paths/weights, optimizer
+  metadata, rollout counts, projection dim/seed, rollout seed, teacher mode, LoRA
+  config, dataset name/split, candidate/target indices, config fingerprint).
+* `scores.jsonl` — one line per candidate, ranked:
+  `{"original_index", "final_score", "checkpoint_scores": [...], "rollout_consistency":
+  [...], "selected", "rank", "invalid"}`. Invalid (non-finite / zero-norm feature)
+  candidates have `final_score: null` and are never selected.
+* `selection_config.json` — the resolved configuration, checkpoint weights, and
+  fingerprint.
+* `target_feature_<ckpt>.pt` — the normalized target group feature per checkpoint
+  (plus a `target_feature.pt` alias for single-checkpoint runs).
+* `candidate_features_<ckpt>.pt` — only with `--save_candidate_features`.
+* `resume/` — partial feature shards + manifest (safe to delete after a completed run).
 
-| File | Always? | Contents |
-|---|---|---|
-| `selected_indices.json` | yes | `{"selected_indices": [...], "metadata": {...}}` — feed this to `opsd_train.py`. |
-| `scores.jsonl` | yes | One JSON object per candidate: `{"original_index", "score", "rank", "selected"}`, ranked by descending score. |
-| `selection_config.json` | yes | The full `LESSOPSDSelectionConfig` plus method name and reference repo. |
-| `target_feature.pt` | LESS-OPSD only | The averaged, normalized projected target gradient (`[projection_dim]`). |
-| `candidate_features.pt` | only with `--save_candidate_features` | All projected candidate features (`[num_candidates, projection_dim]`); can be large. |
+## Colab sizing guidance (not hardcoded anywhere)
 
-`selected_indices.json` is also accepted as a bare list (`[1, 5, 10]`) by
-`opsd_train.py`/`load_selected_indices`.
-
----
-
-## How this differs from original LESS
-
-LESS ([princeton-nlp/LESS](https://github.com/princeton-nlp/LESS), ICML 2024) is used here
-as a **methodological reference only** — it is not vendored and is not a runtime
-dependency. Key differences:
-
-- **Gradient feature**: original LESS uses the supervised cross-entropy gradient
-  `∇ CE(answer | instruction)`. LESS-OPSD uses the **OPSD distillation gradient**
-  `∇ L_OPSD(problem, reference_solution, student_rollout)` from `OPSDTrainer.compute_loss`,
-  evaluated on an **on-policy student rollout**.
-- **Projection**: LESS uses TRAK random projectors (`fast_jl`/CUDA). LESS-OPSD uses a
-  dependency-free **CountSketch** hashing projection (no dense projection matrix).
-- **Scope**: LESS-OPSD's MVP is **static** (single model, single rollout per example, no
-  Adam preconditioning, no multi-checkpoint aggregation, not online/adaptive). These are
-  documented as future extensions in the methodology doc.
-- **Trainable params**: like LESS, gradients are taken only over trainable (LoRA)
-  parameters.
+For an A100/T4 smoke run: `candidate_limit` 32–200, `target_limit` 8–32,
+`num_candidate_rollouts` 1–2, one warmup checkpoint, `max_completion_length` 128–256.
+For a real run: `candidate_limit` 2000+, `target_limit` 128, 2 rollouts, 1–2 checkpoints.
+Wall-clock cost scales as
+`(num_candidates * num_candidate_rollouts + num_targets * num_target_rollouts) *
+num_checkpoints` generations + backward passes.

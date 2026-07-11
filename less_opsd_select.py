@@ -1,33 +1,50 @@
-"""CLI for LESS-OPSD gradient-based data selection (static cached-rollout MVP).
+"""CLI for LESS-OPSD gradient-based data selection (v2: AdamW-aware, multi-rollout,
+optionally multi-checkpoint).
 
 Examples
 --------
-LESS-OPSD selection on a tiny candidate pool::
+Cheap raw-gradient smoke test (base model, one implicit checkpoint)::
 
     python less_opsd_select.py \
       --model_name_or_path Qwen/Qwen3-0.6B \
-      --dataset_name siyanzhao/Openthoughts_math_30k_opsd \
-      --dataset_split train \
-      --candidate_limit 2000 \
-      --target_limit 128 \
-      --selection_fraction 0.05 \
+      --feature_type raw_gradient \
+      --num_candidate_rollouts 1 \
+      --candidate_limit 32 --target_limit 8 \
+      --selection_fraction 0.25 \
       --projection_dim 4096 \
-      --output_dir outputs/less_opsd_selection/test_run \
-      --seed 42
+      --output_dir outputs/less_opsd_selection/raw_smoke
 
-Random baseline (no model needed)::
+AdamW-aware selection from a warmup checkpoint::
 
     python less_opsd_select.py \
-      --selection_method random \
-      --candidate_limit 2000 \
+      --model_name_or_path Qwen/Qwen3-0.6B \
+      --feature_type adamw_candidate_update \
+      --checkpoint_paths outputs/warmup/checkpoint-50 \
+      --num_candidate_rollouts 2 --num_target_rollouts 2 \
+      --candidate_limit 2000 --target_limit 128 \
       --selection_fraction 0.05 \
+      --output_dir outputs/less_opsd_selection/adamw_run \
+      --resume
+
+Reproducible random warmup subset (no model needed; artifact is compatible with
+``opsd_train.py --selected_indices_path``)::
+
+    python less_opsd_select.py \
+      --selection_method warmup_subset \
+      --selection_num_examples 500 \
+      --warmup_subset_seed 7 \
+      --output_dir outputs/warmup_subset
+
+Random baseline::
+
+    python less_opsd_select.py --selection_method random \
+      --candidate_limit 2000 --selection_fraction 0.05 \
       --output_dir outputs/less_opsd_selection/random_smoke
 
-This script never calls ``trainer.train()`` and disables WandB by default.
-
-The candidate gradient is the OPSD distillation gradient (via
-``OPSDTrainer.compute_loss``), not a supervised cross-entropy gradient. See
-``docs/less_opsd_methodology.md``.
+This script never calls ``trainer.train()`` and disables WandB by default. The candidate
+gradient is the OPSD distillation gradient (via ``OPSDTrainer.compute_loss``), not a
+supervised cross-entropy gradient. See ``docs/less_opsd_methodology.md`` and
+``docs/less_opsd_usage.md``.
 """
 
 from __future__ import annotations
@@ -38,8 +55,12 @@ import random
 
 from less_opsd_selector import (
     LESSOPSDSelectionConfig,
-    run_less_opsd_selection,
+    RANDOM_METHOD_NAME,
+    WARMUP_RANDOM_METHOD_NAME,
+    normalize_checkpoint_weights,
+    run_multicheckpoint_selection,
     run_random_selection,
+    validate_selection_config,
 )
 
 
@@ -51,8 +72,9 @@ def parse_args():
         "--selection_method",
         type=str,
         default="less_opsd",
-        choices=["less_opsd", "random"],
-        help="'less_opsd' = gradient alignment selection; 'random' = random baseline.",
+        choices=["less_opsd", "random", "warmup_subset"],
+        help="'less_opsd' = gradient alignment selection; 'random' = random baseline; "
+        "'warmup_subset' = save a reproducible random warmup subset (no model needed).",
     )
 
     # Data
@@ -75,13 +97,60 @@ def parse_args():
         help="Allow candidate and target indices to overlap (default: disjoint).",
     )
 
+    # Feature construction (v2)
+    p.add_argument(
+        "--feature_type",
+        type=str,
+        default="raw_gradient",
+        choices=["raw_gradient", "adamw_candidate_update", "adamw_fixed_preconditioner"],
+        help="Candidate feature: raw OPSD gradient (v1 behavior), hypothetical AdamW "
+        "candidate update, or fixed Adam preconditioner. AdamW modes require "
+        "--checkpoint_paths with saved optimizer state.",
+    )
+    p.add_argument(
+        "--target_objective",
+        type=str,
+        default="opsd",
+        choices=["opsd", "reference_ce"],
+        help="Target gradient objective: 'opsd' (default, OPSD loss with fresh target "
+        "rollouts) or 'reference_ce' (supervised CE on the reference solution).",
+    )
+    p.add_argument("--num_candidate_rollouts", type=int, default=1)
+    p.add_argument("--num_target_rollouts", type=int, default=1)
+
+    # Checkpoints (v2)
+    p.add_argument(
+        "--checkpoint_paths",
+        type=str,
+        nargs="+",
+        default=None,
+        help="One or more HF Trainer checkpoint dirs (LoRA adapter + optimizer.pt). "
+        "When omitted, the base initialization is used (raw_gradient only).",
+    )
+    p.add_argument(
+        "--checkpoint_weighting",
+        type=str,
+        default="uniform",
+        choices=["uniform", "learning_rate", "explicit"],
+    )
+    p.add_argument("--checkpoint_weights", type=float, nargs="+", default=None)
+
     # Selection
-    p.add_argument("--selection_fraction", type=float, default=0.05)
+    p.add_argument("--selection_fraction", type=float, default=None)
     p.add_argument("--selection_num_examples", type=int, default=None)
     p.add_argument("--projection_dim", type=int, default=4096)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42, help="Legacy umbrella seed.")
+    p.add_argument("--projection_seed", type=int, default=None)
+    p.add_argument("--rollout_seed", type=int, default=None)
+    p.add_argument("--candidate_subset_seed", type=int, default=None)
+    p.add_argument("--target_subset_seed", type=int, default=None)
+    p.add_argument("--warmup_subset_seed", type=int, default=None)
     p.add_argument("--gradient_batch_size", type=int, default=1)
     p.add_argument("--save_candidate_features", action="store_true", default=False)
+    p.add_argument("--save_every", type=int, default=25,
+                   help="Save partial (resumable) features every N examples.")
+    p.add_argument("--resume", action="store_true", default=False,
+                   help="Resume from partial artifacts in output_dir (fingerprint-checked).")
     p.add_argument("--output_dir", type=str, default="outputs/less_opsd_selection")
 
     # Model (only used for selection_method=less_opsd)
@@ -125,7 +194,11 @@ def parse_args():
     p.add_argument("--max_completion_length", type=int, default=256)
     p.add_argument("--max_length", type=int, default=2048)
 
-    return p.parse_args()
+    args = p.parse_args()
+    # Legacy default: fraction 0.05 when neither size argument is given.
+    if args.selection_fraction is None and args.selection_num_examples is None:
+        args.selection_fraction = 0.05
+    return args
 
 
 def build_indices(num_candidates_available, num_targets_available, args, same_dataset):
@@ -134,7 +207,8 @@ def build_indices(num_candidates_available, num_targets_available, args, same_da
     When candidate and target come from the same dataset, the two index sets are disjoint
     by default (unless --allow_candidate_target_overlap is set).
     """
-    rng = random.Random(args.seed)
+    subset_seed = args.candidate_subset_seed if args.candidate_subset_seed is not None else args.seed
+    rng = random.Random(subset_seed)
 
     target_limit = args.target_limit
     if target_limit is None and args.selection_method == "less_opsd":
@@ -160,8 +234,10 @@ def build_indices(num_candidates_available, num_targets_available, args, same_da
             cand_perm if args.candidate_limit is None else cand_perm[: args.candidate_limit]
         )
 
+        tgt_seed = args.target_subset_seed if args.target_subset_seed is not None else args.seed
+        tgt_rng = random.Random(tgt_seed)
         tgt_perm = list(range(num_targets_available))
-        rng.shuffle(tgt_perm)
+        tgt_rng.shuffle(tgt_perm)
         target_indices = sorted(tgt_perm[: (target_limit or 0)])
 
     return candidate_indices, target_indices
@@ -169,13 +245,27 @@ def build_indices(num_candidates_available, num_targets_available, args, same_da
 
 def make_config(args) -> LESSOPSDSelectionConfig:
     return LESSOPSDSelectionConfig(
+        feature_type=args.feature_type,
+        target_objective=args.target_objective,
+        num_candidate_rollouts=args.num_candidate_rollouts,
+        num_target_rollouts=args.num_target_rollouts,
+        checkpoint_paths=list(args.checkpoint_paths or []),
+        checkpoint_weighting=args.checkpoint_weighting,
+        checkpoint_weights=args.checkpoint_weights,
         projection_dim=args.projection_dim,
         seed=args.seed,
+        projection_seed=args.projection_seed,
+        rollout_seed=args.rollout_seed,
+        candidate_subset_seed=args.candidate_subset_seed,
+        target_subset_seed=args.target_subset_seed,
+        warmup_subset_seed=args.warmup_subset_seed,
         candidate_limit=args.candidate_limit,
         target_limit=args.target_limit,
         selection_fraction=args.selection_fraction,
         selection_num_examples=args.selection_num_examples,
         gradient_batch_size=args.gradient_batch_size,
+        save_every=args.save_every,
+        resume=args.resume,
         normalize_per_example=True,
         score_metric="dot",
         output_dir=args.output_dir,
@@ -184,8 +274,8 @@ def make_config(args) -> LESSOPSDSelectionConfig:
     )
 
 
-def run_random(args):
-    """Random baseline: no model, no dataset gradients required."""
+def run_random(args, method_name=RANDOM_METHOD_NAME, seed=None):
+    """Random baseline / warmup subset: no model, no dataset gradients required."""
     from datasets import load_dataset
 
     dataset = load_dataset(args.dataset_name, split=args.dataset_split)
@@ -193,9 +283,9 @@ def run_random(args):
     candidate_indices, _ = build_indices(n, n, args, same_dataset=True)
 
     config = make_config(args)
-    result = run_random_selection(candidate_indices, config)
+    result = run_random_selection(candidate_indices, config, method_name=method_name, seed=seed)
     print(
-        f"[random] selected {len(result['selected_indices'])}/{len(candidate_indices)} "
+        f"[{method_name}] selected {len(result['selected_indices'])}/{len(candidate_indices)} "
         f"-> {result['paths']['selected_indices']}"
     )
     return result
@@ -287,6 +377,17 @@ def build_trainer(args, train_dataset):
 def run_less_opsd(args):
     from datasets import load_dataset
 
+    from less_opsd_backend import (
+        OPSDTrainerBackend,
+        build_optimizer_view_for_checkpoint,
+        load_lora_checkpoint_into_trainer,
+        recover_checkpoint_learning_rate,
+    )
+    from less_opsd_selector import OPTIMIZER_AWARE_FEATURE_TYPES
+
+    config = make_config(args)
+    validate_selection_config(config)
+
     candidate_dataset = load_dataset(args.dataset_name, split=args.dataset_split)
     n_candidates = len(candidate_dataset)
 
@@ -309,26 +410,68 @@ def run_less_opsd(args):
             "(and a dataset large enough) or --target_dataset_name."
         )
 
-    print(
-        f"[less_opsd] candidates={len(candidate_indices)} targets={len(target_indices)} "
-        f"projection_dim={args.projection_dim} seed={args.seed}"
+    # Checkpoint list: explicit paths, or the base initialization as a single pseudo
+    # checkpoint (raw_gradient only; validate_selection_config rejects AdamW modes here).
+    if config.checkpoint_paths:
+        checkpoints = [(os.path.basename(os.path.normpath(p)) or p, p)
+                       for p in config.checkpoint_paths]
+    else:
+        checkpoints = [("base", None)]
+
+    learning_rates = None
+    if config.checkpoint_weighting == "learning_rate":
+        learning_rates = [recover_checkpoint_learning_rate(p) for _, p in checkpoints
+                          if p is not None]
+        if len(learning_rates) != len(checkpoints):
+            raise ValueError(
+                "checkpoint_weighting='learning_rate' requires real checkpoint paths "
+                "(the base initialization has no recorded learning rate)."
+            )
+    weights = normalize_checkpoint_weights(
+        config.checkpoint_weighting, len(checkpoints), config.checkpoint_weights, learning_rates
     )
 
-    # The trainer must see the full dataset so absolute indices map correctly.
-    trainer = build_trainer(args, candidate_dataset)
+    print(
+        f"[less_opsd] candidates={len(candidate_indices)} targets={len(target_indices)} "
+        f"feature_type={config.feature_type} target_objective={config.target_objective} "
+        f"checkpoints={[c[0] for c in checkpoints]} weights={[round(w, 4) for w in weights]} "
+        f"projection_dim={config.projection_dim} projection_seed={config.projection_seed} "
+        f"rollout_seed={config.rollout_seed}"
+    )
 
-    config = make_config(args)
-    result = run_less_opsd_selection(
-        trainer=trainer,
+    # One trainer/model instance; per checkpoint we swap in the LoRA adapter weights and
+    # (for AdamW modes) load the matching optimizer state. Only one model is resident.
+    trainer = build_trainer(args, candidate_dataset)
+    backend = OPSDTrainerBackend(trainer)
+
+    def backend_loader(ckpt_id, ckpt_path):
+        if ckpt_path is not None:
+            load_lora_checkpoint_into_trainer(trainer, ckpt_path)
+        opt_view = None
+        if config.feature_type in OPTIMIZER_AWARE_FEATURE_TYPES:
+            opt_view = build_optimizer_view_for_checkpoint(trainer, ckpt_path)
+        return backend, opt_view
+
+    extra_metadata = {
+        "model_name_or_path": args.model_name_or_path,
+        "dataset_name": args.dataset_name,
+        "dataset_split": args.dataset_split,
+        "target_dataset_name": args.target_dataset_name,
+        "target_dataset_split": args.target_dataset_split,
+        "candidate_indices": candidate_indices if len(candidate_indices) <= 10000 else None,
+        "target_indices": target_indices,
+    }
+
+    result = run_multicheckpoint_selection(
+        backend_loader=backend_loader,
+        checkpoints=checkpoints,
+        checkpoint_weights=weights,
         candidate_dataset=candidate_dataset,
         candidate_indices=candidate_indices,
         target_dataset=target_dataset,
         target_indices=target_indices,
         config=config,
-    )
-    print(
-        f"[less_opsd] selected {len(result['selected_indices'])}/{len(candidate_indices)} "
-        f"-> {result['paths']['selected_indices']}"
+        extra_metadata=extra_metadata,
     )
     return result
 
@@ -344,6 +487,9 @@ def main():
 
     if args.selection_method == "random":
         run_random(args)
+    elif args.selection_method == "warmup_subset":
+        seed = args.warmup_subset_seed if args.warmup_subset_seed is not None else args.seed
+        run_random(args, method_name=WARMUP_RANDOM_METHOD_NAME, seed=seed)
     else:
         run_less_opsd(args)
 
